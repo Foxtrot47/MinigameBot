@@ -3,25 +3,23 @@ Telegram userbot — Mini-game word solver.
 
 Flow:
   1. Start Telethon client (prompts for OTP on first run, then uses .session).
-  2. Initialise EasyOCR reader once at startup (expensive model load, amortised).
-  3. Listen for new messages in TARGET_CHANNEL from TARGET_BOT.
-  4. When the trigger message with a spoiler image arrives:
+  2. Listen for new messages in TARGET_CHANNEL from TARGET_BOT.
+  3. When the trigger message with a spoiler image arrives:
        - Download the image to a temp file
-       - Run OCR (in a thread so the event loop stays unblocked)
+       - Send it to the Gemini Vision API with a focused prompt
        - Reply with the recognised word immediately
 """
 
 import asyncio
+import base64
 import logging
 import os
 import re
 import tempfile
 from pathlib import Path
 
-import easyocr
-import numpy as np
+import aiohttp
 from dotenv import load_dotenv
-from PIL import Image, ImageEnhance, ImageOps
 from telethon import TelegramClient, events
 from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto
 
@@ -46,9 +44,15 @@ PHONE: str = os.environ["PHONE"]
 TARGET_CHANNEL: str = os.environ["TARGET_CHANNEL"]
 TARGET_BOT: str = os.environ["TARGET_BOT"]
 SESSION_NAME: str = os.getenv("SESSION_NAME", "mingame_session")
+GEMINI_API_KEY: str = os.environ["GEMINI_API_KEY"]
 
 # Case-insensitive substring that identifies the trigger message.
 TRIGGER_PHRASE = "be the first to write the word shown in the photo"
+
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-2.5-flash:generateContent?key={key}"
+)
 
 
 def _parse_entity(value: str) -> str | int:
@@ -64,97 +68,73 @@ CHANNEL_ENTITY = _parse_entity(TARGET_CHANNEL)
 BOT_ENTITY = _parse_entity(TARGET_BOT)
 
 # ---------------------------------------------------------------------------
-# OCR
+# Vision OCR via Gemini
 # ---------------------------------------------------------------------------
 
-def init_ocr() -> easyocr.Reader:
-    """Load EasyOCR once at startup. First run downloads model weights (~300 MB)."""
-    log.info("Initialising EasyOCR — may take a few seconds on first run...")
-    reader = easyocr.Reader(["en"], gpu=False, verbose=False)
-    log.info("EasyOCR ready.")
-    return reader
-
-
-def preprocess(image_path: str) -> np.ndarray:
+async def gemini_ocr(session: aiohttp.ClientSession, image_path: str) -> str | None:
     """
-    Prepare the image for OCR:
-      1. Grayscale — removes color noise from decorative fonts/gradients.
-      2. Auto-invert — ensures text is dark on a light background.
-         Game images often use light/white text on dark backgrounds;
-         EasyOCR performs better on dark-on-light.
-      3. Contrast boost — sharpens faint or anti-aliased edges.
-      4. Upscale — helps with small images (EasyOCR works best >= 32px tall).
+    Send *image_path* to Gemini 2.0 Flash Vision and return the game word.
 
-    Returns a numpy array (H×W×3 RGB) that EasyOCR accepts directly,
-    avoiding a redundant disk write.
+    Gemini understands the image semantically — no bounding-box tricks needed.
+    The prompt instructs it to ignore logos/UI chrome and return only the
+    prominent word shown in the centre of the image.
     """
-    img = Image.open(image_path).convert("RGB")
+    with open(image_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
 
-    gray = img.convert("L")
+    payload = {
+        "contents": [{
+            "parts": [
+                {
+                    "inline_data": {
+                        "mime_type": "image/jpeg",
+                        "data": b64,
+                    }
+                },
+                {
+                    "text": (
+                        "This image is from a word-guessing game. "
+                        "What is the large word displayed prominently in the centre? "
+                        "Ignore any logos, bot names, or UI elements. "
+                        "Reply with only that single word in uppercase, nothing else."
+                    )
+                },
+            ]
+        }],
+        "generationConfig": {
+            "temperature": 0,        # deterministic — no creativity needed
+            "maxOutputTokens": 200,  # thinking models use extra tokens internally
+        },
+    }
 
-    # Auto-invert: if the image is predominantly dark, the text is likely light.
-    # Median pixel value < 128 → dark background → invert so text becomes dark.
-    median = float(np.median(np.array(gray)))
-    if median < 128:
-        gray = ImageOps.invert(gray)
-
-    # Contrast boost — 2.5x is aggressive but effective on styled text.
-    gray = ImageEnhance.Contrast(gray).enhance(2.5)
-
-    # Upscale small images to at least 64px tall for better glyph detection.
-    if gray.height < 64:
-        scale = 64 / gray.height
-        gray = gray.resize(
-            (int(gray.width * scale), int(gray.height * scale)),
-            Image.LANCZOS,
-        )
-
-    # Convert back to RGB (EasyOCR expects 3-channel input).
-    return np.array(gray.convert("RGB"))
-
-
-def extract_word(reader: easyocr.Reader, image_path: str) -> str | None:
-    """
-    Run OCR on *image_path* and return the most likely single word.
-
-    EasyOCR returns [(bounding_box, text, confidence), ...].
-    We filter by confidence, strip non-alpha characters, and return the
-    segment with the highest confidence score.
-    """
+    url = GEMINI_URL.format(key=GEMINI_API_KEY)
     try:
-        processed = preprocess(image_path)
-        results = reader.readtext(processed, detail=1)
+        async with session.post(
+            url,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            data = await resp.json(content_type=None)
     except Exception as exc:
-        log.error("EasyOCR error: %s", exc)
+        log.error("Gemini request failed: %s", exc)
         return None
 
-    if not results:
-        log.warning("EasyOCR returned no results for %s", image_path)
+    # Extract the text from the response
+    try:
+        raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except (KeyError, IndexError) as exc:
+        log.error("Unexpected Gemini response structure: %s | data: %s", exc, data)
         return None
 
-    log.debug("Raw OCR results: %s", results)
+    # Strip anything that isn't a letter (in case Gemini adds punctuation)
+    word = re.sub(r"[^A-Za-z]", "", raw).upper()
 
-    # Each result: (bounding_box, text, confidence)
-    # bounding_box is [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] (4 corners).
-    # We pick by largest bounding box area, not confidence — the target word
-    # is always the biggest text in the image; logo/watermark text is small.
-    candidates: list[tuple[str, float, float]] = []  # (text, confidence, area)
-    for bbox, text, confidence in results:
-        cleaned = re.sub(r"[^A-Za-z]", "", text).strip()
-        if not cleaned or confidence < 0.2:
-            continue
-        xs = [p[0] for p in bbox]
-        ys = [p[1] for p in bbox]
-        area = (max(xs) - min(xs)) * (max(ys) - min(ys))
-        candidates.append((cleaned, confidence, area))
-
-    if not candidates:
-        log.warning("No usable text after cleaning. Raw results: %s", results)
+    if not word:
+        log.warning("Gemini returned no usable text. Raw: %r", raw)
         return None
 
-    best_text, best_conf, best_area = max(candidates, key=lambda x: x[2])
-    log.info("OCR result: %r (confidence=%.2f, area=%.0f)", best_text, best_conf, best_area)
-    return best_text
+    log.info("Gemini OCR result: %r", word)
+    return word
 
 # ---------------------------------------------------------------------------
 # Image download
@@ -212,15 +192,15 @@ async def resolve_peer_ids(client: TelegramClient) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    # Initialise OCR before connecting so model loading doesn't delay first reply
-    ocr_reader = init_ocr()
-
     client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
     await client.start(phone=PHONE)
     me = await client.get_me()
     log.info("Connected as %s (id=%d)", me.username or me.first_name, me.id)
 
     channel_id, bot_id = await resolve_peer_ids(client)
+
+    # Single aiohttp session shared across all handlers (reuses connections).
+    http = aiohttp.ClientSession()
 
     @client.on(events.NewMessage(chats=channel_id))
     async def handle(event: events.NewMessage.Event) -> None:
@@ -238,7 +218,6 @@ async def main() -> None:
         if TRIGGER_PHRASE not in text:
             return
 
-        # Must have an image
         if message.media is None:
             log.warning("Trigger message %d has no media — skipping.", message.id)
             return
@@ -251,9 +230,7 @@ async def main() -> None:
             if tmp_path is None:
                 return
 
-            # OCR is synchronous/CPU-bound — run in thread pool to keep loop free
-            loop = asyncio.get_event_loop()
-            word = await loop.run_in_executor(None, extract_word, ocr_reader, tmp_path)
+            word = await gemini_ocr(http, tmp_path)
 
             if not word:
                 log.error("Could not extract a word from message %d image.", message.id)
@@ -270,7 +247,7 @@ async def main() -> None:
 
     # -----------------------------------------------------------------------
     # Test command: reply to any message with .ocr
-    # Deletes your command instantly; prints OCR result to console only.
+    # Deletes your command instantly; prints Gemini result to console only.
     # -----------------------------------------------------------------------
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.ocr$"))
     async def test_ocr(event: events.NewMessage.Event) -> None:
@@ -295,8 +272,7 @@ async def main() -> None:
                 log.info("[.ocr] Could not download image.")
                 return
 
-            loop = asyncio.get_event_loop()
-            word = await loop.run_in_executor(None, extract_word, ocr_reader, tmp_path)
+            word = await gemini_ocr(http, tmp_path)
 
             if word:
                 log.info("[.ocr] Result: %r", word)
@@ -314,7 +290,10 @@ async def main() -> None:
         channel_id,
         bot_id,
     )
-    await client.run_until_disconnected()
+    try:
+        await client.run_until_disconnected()
+    finally:
+        await http.close()
 
 
 if __name__ == "__main__":
