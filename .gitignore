@@ -1,0 +1,27 @@
+# Telethon session file — contains your auth token, never commit this
+*.session
+*.session-journal
+
+# Real environment config — only commit .env.example
+.env
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# EasyOCR model cache (large binary files, downloaded on first run)
+.EasyOCR/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE files
+.vscode/
+.idea/
+*.egg-info/
+dist/
+build/

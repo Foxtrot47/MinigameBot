@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep:*)",
+      "Bash(pip show telethon 2>&1 && pip show easyocr 2>&1 && pip show python-dotenv 2>&1)",
+      "Bash(python:*)"
+    ]
+  }
+}
